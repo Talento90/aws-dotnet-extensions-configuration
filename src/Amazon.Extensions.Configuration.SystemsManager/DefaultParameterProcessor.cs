@@ -14,6 +14,9 @@
  */
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using Amazon.SimpleSystemsManagement;
 using Amazon.SimpleSystemsManagement.Model;
 using Microsoft.Extensions.Configuration;
 
@@ -35,9 +38,60 @@ namespace Amazon.Extensions.Configuration.SystemsManager
             var name = parameter.Name.StartsWith(path, StringComparison.OrdinalIgnoreCase) 
                 ? parameter.Name.Substring(path.Length) 
                 : parameter.Name;
+#if NETCOREAPP3_1_OR_GREATER
+            return name.TrimStart('/').Replace("/", KeyDelimiter, StringComparison.InvariantCulture);
+#else
             return name.TrimStart('/').Replace("/", KeyDelimiter);
+#endif
         }
 
         public virtual string GetValue(Parameter parameter, string path) => parameter.Value;
+
+        private IEnumerable<KeyValuePair<string, string>> ParseStringList(Parameter parameter, string path)
+        {
+            // Items in a StringList must be separated by a comma (,).
+            // You can't use other punctuation or special characters to escape items in the list.
+            // If you have a parameter value that requires a comma, then use the String type.
+            // https://docs.aws.amazon.com/systems-manager/latest/userguide/param-create-cli.html#param-create-cli-stringlist
+            return parameter.Value.Split(',').Select((value, idx) =>
+                new KeyValuePair<string, string>($"{GetKey(parameter, path)}:{idx}", value));
+        }
+
+        public virtual IDictionary<string, string> ProcessParameters(IEnumerable<Parameter> parameters, string path)
+        {
+            var result = new List<KeyValuePair<string, string>>();
+            foreach (var parameter in parameters.Where(parameter => IncludeParameter(parameter, path)))
+            {
+                if (parameter.Type == ParameterType.StringList)
+                {
+                    var parameterList = ParseStringList(parameter, path);
+                    
+                    // Check for duplicate parameter keys.
+                    var stringListKeys = parameterList.Select(p => p.Key);
+                    var duplicateKeys = result.Where(r => stringListKeys.Contains(r.Key, StringComparer.OrdinalIgnoreCase)).Select(r => r.Key);
+                    if (duplicateKeys.Count() > 0)
+                    {
+                        throw new DuplicateParameterException($"Duplicate parameters '{string.Join(";", duplicateKeys)}' found. Parameter keys are case-insensitive.");
+                    }
+                    
+                    result.AddRange(parameterList);
+                }
+                else
+                {
+                    string parameterKey = GetKey(parameter, path);
+
+                    // Check for duplicate parameter key.
+                    if (result.Any(r => string.Equals(r.Key, parameterKey, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        throw new DuplicateParameterException($"Duplicate parameter '{parameterKey}' found. Parameter keys are case-insensitive.");
+                    }
+
+                    result.Add(new KeyValuePair<string, string>(parameterKey, GetValue(parameter, path)));
+                }
+            }
+
+            return result.ToDictionary(parameter => parameter.Key, parameter => parameter.Value,
+                StringComparer.OrdinalIgnoreCase);
+        }
     }
 }
